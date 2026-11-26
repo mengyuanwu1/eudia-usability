@@ -18,6 +18,25 @@ const SESSION_ORDER = [
   'challenge_active',
 ] as const;
 type SessionKey = (typeof SESSION_ORDER)[number];
+const EVENT_NAMES = [
+  'study_screen_view', 'activity_started', 'activity_completed',
+  'survey_submitted', 'calendar_saved', 'ai_request',
+  'challenge_started', 'challenge_returned',
+  'onboarding_saved', 'completion_redirect',
+  'study_resumed', 'visibility_changed',
+] as const;
+type StudyEventName = (typeof EVENT_NAMES)[number];
+const SCREEN_NAMES = [
+  'signin', 'onboarding', 'onboarding_intro', 'onboarding_imagery',
+  'onboarding_essay', 'onboarding_domains', 'calendar', 'session',
+  'survey', 'complete',
+] as const;
+const AI_OPERATIONS = [
+  'categorize_bps', 'recommend_philosopher', 'philosophy_turn',
+  'generate_challenge',
+] as const;
+const OUTCOMES = ['success', 'error', 'done', 'partly', 'not_today'] as const;
+const VISIBILITY_STATES = ['visible', 'hidden'] as const;
 
 interface Profile {
   essay: string;
@@ -53,14 +72,24 @@ interface StudyState {
   onboarding?: Profile;
   calendarEvents: CalendarEvent[];
   sessions: Partial<Record<SessionKey, Session>>;
+  launchContext?: StoredLaunchContext;
+}
+
+interface StoredLaunchContext {
+  prolificPid?: string;
+  studyId?: string;
+  sessionId?: string;
+  source: 'prolific';
+  verified: false;
+  capturedAt: string;
 }
 
 function uidOrThrow(request: CallableRequest<unknown>): string {
   const uid = request.auth?.uid;
   if (!uid) throw new HttpsError('unauthenticated', 'Sign in to continue.');
   const firebaseClaims = request.auth?.token['firebase'] as Record<string, unknown> | undefined;
-  if (firebaseClaims?.['sign_in_provider'] !== 'google.com') {
-    throw new HttpsError('permission-denied', 'Use Google sign-in to join the study.');
+  if (!['google.com', 'anonymous'].includes(String(firebaseClaims?.['sign_in_provider'] ?? ''))) {
+    throw new HttpsError('permission-denied', 'Use the study sign-in to continue.');
   }
   return uid;
 }
@@ -83,7 +112,93 @@ function stateFrom(data: admin.firestore.DocumentData | undefined): StudyState {
       ? data['calendarEvents'] as CalendarEvent[] : [],
     sessions: data['sessions'] && typeof data['sessions'] === 'object'
       ? data['sessions'] as StudyState['sessions'] : {},
+    launchContext: data['launchContext'] as StoredLaunchContext | undefined,
   };
+}
+
+function parseLaunchContext(value: unknown): StoredLaunchContext | null {
+  const raw = asRecord(value);
+  if (raw['source'] !== 'prolific') return null;
+  const id = (name: 'prolificPid' | 'studyId' | 'sessionId'): string | undefined => {
+    const input = raw[name];
+    if (input === undefined || input === null || input === '') return undefined;
+    if (typeof input !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(input)) {
+      throw new HttpsError('invalid-argument', `Invalid ${name} launch parameter.`);
+    }
+    return input;
+  };
+  const prolificPid = id('prolificPid');
+  const studyId = id('studyId');
+  const sessionId = id('sessionId');
+  if (!prolificPid || !/^[A-Za-z0-9]{24}$/.test(prolificPid)) {
+    throw new HttpsError('invalid-argument', 'A valid Prolific participant ID is required.');
+  }
+  return {
+    ...(prolificPid ? { prolificPid } : {}),
+    ...(studyId ? { studyId } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    source: 'prolific',
+    verified: false,
+    capturedAt: new Date().toISOString(),
+  };
+}
+
+function parseEventName(value: unknown): StudyEventName {
+  if (typeof value !== 'string' || !EVENT_NAMES.includes(value as StudyEventName)) {
+    throw new HttpsError('invalid-argument', 'Unknown study event.');
+  }
+  return value as StudyEventName;
+}
+
+function parseEventMetadata(name: StudyEventName, value: unknown): Record<string, string | number> {
+  const raw = asRecord(value);
+  const allowedKeys = new Set([
+    'screen', 'sessionKey', 'count', 'operation', 'outcome',
+    'latencyMs', 'elapsedSeconds', 'visibility',
+  ]);
+  if (Object.keys(raw).some((key) => !allowedKeys.has(key))) {
+    throw new HttpsError('invalid-argument', 'Event metadata contains an unsupported field.');
+  }
+  const parsed: Record<string, string | number> = {};
+  const enumField = (key: string, allowed: readonly string[]) => {
+    if (raw[key] === undefined) return;
+    if (typeof raw[key] !== 'string' || !allowed.includes(raw[key])) {
+      throw new HttpsError('invalid-argument', `Invalid ${key} event metadata.`);
+    }
+    parsed[key] = raw[key];
+  };
+  const intField = (key: string, maximum: number) => {
+    if (raw[key] === undefined) return;
+    if (typeof raw[key] !== 'number' || !Number.isInteger(raw[key]) || raw[key] < 0 || raw[key] > maximum) {
+      throw new HttpsError('invalid-argument', `Invalid ${key} event metadata.`);
+    }
+    parsed[key] = raw[key];
+  };
+  enumField('screen', SCREEN_NAMES);
+  enumField('sessionKey', SESSION_ORDER);
+  enumField('operation', AI_OPERATIONS);
+  enumField('outcome', OUTCOMES);
+  enumField('visibility', VISIBILITY_STATES);
+  intField('count', 50);
+  intField('latencyMs', 120000);
+  intField('elapsedSeconds', 3600);
+  if (name === 'study_screen_view' && !parsed['screen']) {
+    throw new HttpsError('invalid-argument', 'Screen is required.');
+  }
+  if (['activity_started', 'activity_completed', 'survey_submitted',
+    'challenge_started', 'challenge_returned'].includes(name) && !parsed['sessionKey']) {
+    throw new HttpsError('invalid-argument', 'Session key is required.');
+  }
+  if (name === 'calendar_saved' && parsed['count'] === undefined) {
+    throw new HttpsError('invalid-argument', 'Event count is required.');
+  }
+  if (name === 'ai_request' && (!parsed['operation'] || !parsed['outcome'])) {
+    throw new HttpsError('invalid-argument', 'AI operation and outcome are required.');
+  }
+  if (name === 'visibility_changed' && !parsed['visibility']) {
+    throw new HttpsError('invalid-argument', 'Visibility state is required.');
+  }
+  return parsed;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -186,10 +301,24 @@ function parseSurvey(value: unknown): SurveyAnswers {
 
 export const studyGetState = onCall({ region: REGION }, async (request) => {
   const ref = runRef(uidOrThrow(request));
+  const launchContext = parseLaunchContext(asRecord(request.data)['launchContext']);
   return admin.firestore().runTransaction(async (tx) => {
     const snap = await tx.get(ref);
-    if (snap.exists) return stateFrom(snap.data());
-    const state = emptyState();
+    if (snap.exists) {
+      const state = stateFrom(snap.data());
+      if (state.launchContext && launchContext && (
+        state.launchContext.prolificPid !== launchContext.prolificPid ||
+        state.launchContext.studyId !== launchContext.studyId ||
+        state.launchContext.sessionId !== launchContext.sessionId
+      )) {
+        throw new HttpsError('failed-precondition',
+          'This browser has a different participant session. Use a separate browser profile.');
+      }
+      if (state.launchContext || !launchContext) return state;
+      throw new HttpsError('failed-precondition',
+        'A preview study already exists in this browser. Use a separate browser profile.');
+    }
+    const state = { ...emptyState(), ...(launchContext ? { launchContext } : {}) };
     tx.set(ref, {
       ...state,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -197,6 +326,47 @@ export const studyGetState = onCall({ region: REGION }, async (request) => {
     });
     return state;
   });
+});
+
+export const studyLogEvent = onCall({ region: REGION }, async (request) => {
+  const uid = uidOrThrow(request);
+  const raw = asRecord(request.data);
+  const name = parseEventName(raw['name']);
+  const metadata = parseEventMetadata(name, raw['metadata']);
+  const db = admin.firestore();
+  const ref = runRef(uid);
+  const quotaRef = db.collection('studyEventQuota').doc(uid);
+  const eventRef = ref.collection('events').doc();
+  await db.runTransaction(async (tx) => {
+    const [runSnap, quotaSnap] = await Promise.all([tx.get(ref), tx.get(quotaRef)]);
+    if (!runSnap.exists) {
+      throw new HttpsError('failed-precondition', 'Open the study before logging events.');
+    }
+    const quota = asRecord(quotaSnap.data());
+    const total = Number(quota['total'] ?? 0);
+    if (!Number.isFinite(total) || total >= 500) {
+      throw new HttpsError('resource-exhausted', 'Study event limit reached.');
+    }
+    const now = Date.now();
+    const minuteStart = Number(quota['minuteStart'] ?? 0);
+    const minuteCount = now - minuteStart < 60000 ? Number(quota['minuteCount'] ?? 0) : 0;
+    if (!Number.isFinite(minuteCount) || minuteCount >= 60) {
+      throw new HttpsError('resource-exhausted', 'Too many study events.');
+    }
+    tx.create(eventRef, {
+      name,
+      metadata,
+      protocolVersion: 1,
+      recordedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    tx.set(quotaRef, {
+      total: total + 1,
+      minuteStart: minuteCount === 0 ? now : minuteStart,
+      minuteCount: minuteCount + 1,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  });
+  return { ok: true };
 });
 
 export const studySaveOnboarding = onCall({ region: REGION }, async (request) => {

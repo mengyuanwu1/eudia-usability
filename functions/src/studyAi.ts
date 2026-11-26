@@ -65,8 +65,8 @@ function requireUid(request: CallableRequest<unknown>): string {
   const uid = request.auth?.uid;
   if (!uid) throw new HttpsError('unauthenticated', 'Sign in to continue.');
   const firebaseClaims = asObject(asObject(request.auth?.token)['firebase']);
-  if (firebaseClaims['sign_in_provider'] !== 'google.com') {
-    throw new HttpsError('permission-denied', 'Use Google sign-in to join the study.');
+  if (!['anonymous', 'google.com'].includes(String(firebaseClaims['sign_in_provider'] ?? ''))) {
+    throw new HttpsError('permission-denied', 'Use the study sign-in to continue.');
   }
   return uid;
 }

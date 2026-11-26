@@ -15,4 +15,5 @@ export {
   studySaveCalendarEvents,
   studySaveSession,
   studySaveSurvey,
+  studyLogEvent,
 } from './studyState';

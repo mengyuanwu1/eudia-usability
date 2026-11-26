@@ -6,6 +6,7 @@ import {
   categorizeBps,
   generateChallenge,
   getCurrentUser,
+  getLaunchContext,
   getPhilosophers,
   getStudy,
   recommendPhilosopher,
@@ -14,8 +15,7 @@ import {
   saveOnboarding,
   saveSession,
   saveSurvey,
-  signIn,
-  signOutStudy,
+  trackEvent,
   type CalendarEvent,
   type ChatMessage,
   type Domain,
@@ -25,7 +25,6 @@ import {
   type PhilosopherRecommendation,
   type SessionKey,
   type StudyState,
-  type StudyUser,
   type SurveyAnswers,
 } from './studyApi';
 
@@ -133,6 +132,29 @@ function minutesAndSeconds(seconds: number): string {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong. Try again.';
+}
+
+function trackSafe(name: Parameters<typeof trackEvent>[0], metadata?: Parameters<typeof trackEvent>[1]): void {
+  void trackEvent(name, metadata).catch(() => {});
+}
+
+function trackAi(operation: 'categorize_bps' | 'recommend_philosopher' | 'philosophy_turn' | 'generate_challenge', outcome: 'success' | 'error', startedAt: number): void {
+  trackSafe('ai_request', { operation, outcome, latencyMs: Math.min(120000, Math.max(0, Math.round(performance.now() - startedAt))) });
+}
+
+function trackedElapsedSeconds(startedAt: number, returnedAt: number): number {
+  return Math.min(3600, Math.max(0, Math.round((returnedAt - startedAt) / 1000)));
+}
+
+function safeProlificCompletionUrl(raw: string | undefined): string | null {
+  if (!raw?.trim()) return null;
+  try {
+    const url = new URL(raw.trim());
+    if (url.protocol !== 'https:' || url.hostname !== 'app.prolific.com' || url.pathname !== '/submissions/complete' || !url.searchParams.get('cc')?.trim()) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
 }
 
 function IconCheck() {
@@ -257,7 +279,7 @@ function SessionContent({
 
 export default function App() {
   const [study, setStudy] = useState<StudyState | null>(null);
-  const [user, setUser] = useState<StudyUser | null>(null);
+  const [launch, setLaunch] = useState<ReturnType<typeof getLaunchContext> | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [error, setError] = useState('');
@@ -277,6 +299,9 @@ export default function App() {
   const [eventNotes, setEventNotes] = useState('');
   const [eventError, setEventError] = useState('');
   const [editingEventId, setEditingEventId] = useState<string | null>(null);
+  const lastTrackedStep = useRef('');
+  const startupStarted = useRef(false);
+  const [redirecting, setRedirecting] = useState(false);
 
   const ensureDraftOwner = (uid: string) => {
     const prior = localStorage.getItem('eudia-study-draft-owner');
@@ -296,13 +321,12 @@ export default function App() {
     setLoadError('');
     try {
       const current = await getCurrentUser();
-      setUser(current);
-      if (current) {
-        ensureDraftOwner(current.uid);
-        setStudy(await getStudy());
-      } else {
-        setStudy(null);
-      }
+      if (!current) throw new Error('Could not start your study session. Please reload this page.');
+      ensureDraftOwner(current.uid);
+      setLaunch(getLaunchContext());
+      const loaded = await getStudy();
+      setStudy(loaded);
+      if (loaded.onboarding || loaded.calendarEvents.length || Object.keys(loaded.sessions).length) trackSafe('study_resumed');
     } catch (cause) {
       setLoadError(errorText(cause));
     } finally {
@@ -310,32 +334,21 @@ export default function App() {
     }
   };
 
-  const handleSignIn = async () => {
-    setBusy(true); setLoadError('');
-    try {
-      const signed = await signIn();
-      ensureDraftOwner(signed.uid);
-      setUser(signed);
-      setStudy(await getStudy());
-    } catch (cause) { setLoadError(errorText(cause)); }
-    finally { setBusy(false); }
-  };
-
-  const handleSignOut = async () => {
-    setBusy(true); setLoadError('');
-    try {
-      await signOutStudy();
-      setStudy(null);
-      setUser(null);
-    } catch (cause) { setLoadError(errorText(cause)); }
-    finally { setBusy(false); }
-  };
-
-  useEffect(() => { void reload(); }, []);
+  useEffect(() => {
+    if (startupStarted.current) return;
+    startupStarted.current = true;
+    void reload();
+  }, []);
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, []);
+  useEffect(() => {
+    if (!study) return;
+    const onVisibility = () => trackSafe('visibility_changed', { visibility: document.visibilityState === 'hidden' ? 'hidden' : 'visible' });
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, [!!study]);
 
   const step = useMemo(() => study ? deriveStep(study) : { kind: 'onboarding' } as MainStep, [study]);
   const calendarDay = step.kind === 'calendar' && !calendarDraft.length ? yesterdayDateKey() : targetDay;
@@ -347,12 +360,22 @@ export default function App() {
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, [step.kind, step.kind === 'session' || step.kind === 'survey' ? step.key : '', onboardingStage]);
+  useEffect(() => {
+    if (!study) return;
+    const screen = step.kind === 'onboarding' ? (`onboarding_${onboardingStage}` as const) : step.kind;
+    const signature = `${screen}:${step.kind === 'session' || step.kind === 'survey' ? step.key : ''}`;
+    if (lastTrackedStep.current === signature) return;
+    lastTrackedStep.current = signature;
+    trackSafe('study_screen_view', { screen, ...(step.kind === 'session' || step.kind === 'survey' ? { sessionKey: step.key } : {}) });
+    if (step.kind === 'session') trackSafe('activity_started', { sessionKey: step.key });
+  }, [study, step.kind, step.kind === 'session' || step.kind === 'survey' ? step.key : '', onboardingStage]);
 
-  const commit = async (operation: () => Promise<StudyState>) => {
+  const commit = async (operation: () => Promise<StudyState>, onSaved?: () => void) => {
     setError('');
     setBusy(true);
     try {
       setStudy(await operation());
+      onSaved?.();
     } catch (cause) {
       setError(errorText(cause));
     } finally {
@@ -368,10 +391,13 @@ export default function App() {
     if (!onboarding.essay.trim()) return;
     setBusy(true);
     setError('');
+    const startedAt = performance.now();
     try {
       const domains = await categorizeBps(onboarding.essay.trim());
       setOnboarding((previous) => ({ ...previous, domains }));
+      trackAi('categorize_bps', 'success', startedAt);
     } catch (cause) {
+      trackAi('categorize_bps', 'error', startedAt);
       setError(`Eudia could not organize your writing automatically. You can fill the four areas yourself. ${errorText(cause)}`);
     } finally {
       setOnboardingStage('domains');
@@ -385,7 +411,7 @@ export default function App() {
       domains: Object.fromEntries(DOMAINS.map((domain) => [domain, onboarding.domains[domain].trim()])) as DomainSummaries,
       goal: onboarding.goal.trim(),
     };
-    void commit(() => saveOnboarding(profile));
+    void commit(() => saveOnboarding(profile), () => trackSafe('onboarding_saved'));
   };
 
   const addEvent = () => {
@@ -415,19 +441,32 @@ export default function App() {
 
   const handleSurvey = (key: SessionKey, answers: SurveyAnswers) => {
     setSurveyDrafts((previous) => ({ ...previous, [key]: answers }));
-    void commit(() => saveSurvey(key, answers));
+    void commit(() => saveSurvey(key, answers), () => trackSafe('survey_submitted', { sessionKey: key }));
   };
 
   const currentGroup = step.kind === 'session' || step.kind === 'survey' ? Math.floor(step.index / 2) : -1;
   const completedSessions = study ? SESSION_ORDER.filter((key) => !!study.sessions[key]?.surveySubmittedAt).length : 0;
   const progress = step.kind === 'complete' ? 100 : step.kind === 'onboarding' ? 4 : step.kind === 'calendar' ? 15 : 20 + (completedSessions / 6) * 80;
   const progressTitle = step.kind === 'onboarding' ? 'Getting to know you' : step.kind === 'calendar' ? 'Yesterday’s calendar' : step.kind === 'complete' ? 'All complete' : `Experience ${step.index + 1} of 6`;
+  const launchError = launch && 'error' in launch && typeof launch.error === 'string' ? launch.error : '';
+  const storedLaunch = study?.launchContext;
+  const paidRun = storedLaunch?.source === 'prolific' && /^[A-Za-z0-9]{24}$/.test(storedLaunch.prolificPid ?? '');
+  const prolificParticipant = paidRun && !launchError;
+  const completionUrl = safeProlificCompletionUrl(import.meta.env.VITE_PROLIFIC_COMPLETION_URL);
+
+  const handleCompletionClick = async (event: React.MouseEvent<HTMLAnchorElement>) => {
+    if (!completionUrl || redirecting) { event.preventDefault(); return; }
+    event.preventDefault();
+    setRedirecting(true);
+    await Promise.race([
+      trackEvent('completion_redirect').catch(() => {}),
+      new Promise<void>((resolve) => window.setTimeout(resolve, 1500)),
+    ]);
+    window.location.assign(completionUrl);
+  };
 
   if (loading) {
     return <div className="app-shell loading-wrap"><div className="card loading-card"><div className="spinner" aria-label="Loading" /><strong>Opening your Eudia study…</strong></div></div>;
-  }
-  if (!user) {
-    return <div className="app-shell"><header className="topbar"><span className="brand"><span className="brand-mark"><img src={avatarUrl} alt="" /></span><span>eudia</span></span><span className="topbar-note">A guided self-discovery study</span></header><div className="page-wrap" style={{ maxWidth: 680 }}><div className="card main-card"><p className="eyebrow">Welcome to Eudia</p><h1>Your reflection journey starts here.</h1><p className="lead">Sign in to save your progress across the six short experiences.</p><div className="hero-illustration"><img src={avatarUrl} alt="Eudia, your reflection companion" /></div>{loadError && <div className="inline-error" role="alert">{loadError}</div>}<button className="btn" disabled={busy} onClick={() => void handleSignIn()}>{busy ? 'Signing in…' : 'Continue with Google'}</button></div></div></div>;
   }
   if (loadError || !study) {
     return <div className="app-shell loading-wrap"><div className="card loading-card"><h2>We couldn’t open your study.</h2><p className="body-copy">{loadError}</p><button className="btn" onClick={() => void reload()}>Try again</button></div></div>;
@@ -437,9 +476,10 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <a className="brand" href="#main" aria-label="Eudia study home"><span className="brand-mark"><img src={avatarUrl} alt="" /></span><span>eudia</span></a>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}><span className="topbar-note">{user.displayName ?? 'A guided self-discovery study'}</span><button className="btn ghost small" disabled={busy} onClick={() => void handleSignOut()}>Sign out</button></div>
+        <div className="topbar-participant"><span className="topbar-note">Study participant</span>{launchError ? <span className="preview-pill">Link issue</span> : !prolificParticipant && <span className="preview-pill">Preview</span>}</div>
       </header>
       <div className="page-wrap">
+        {launchError && <div className="inline-error launch-warning" role="alert">{launchError}. Reopen the study from Prolific or contact the study team. Completion return is unavailable from this link.</div>}
         <div className="progress-panel" aria-label="Study progress">
           <div className="progress-copy"><span className="progress-kicker">Your journey</span><strong>{progressTitle}</strong></div>
           <div className="progress-track"><div className="progress-fill" style={{ width: `${progress}%` }} /></div>
@@ -452,10 +492,14 @@ export default function App() {
               {step.kind === 'onboarding' && renderOnboarding()}
               {step.kind === 'calendar' && renderCalendar()}
               {step.kind === 'session' && (
-                <SessionContent key={step.key} sessionKey={step.key} state={study} draft={sessionDrafts[step.key] ?? {}} update={(patch) => updateSessionDraft(step.key, patch)} busy={busy} onComplete={(data) => void commit(() => saveSession(step.key, data))} />
+                <SessionContent key={step.key} sessionKey={step.key} state={study} draft={sessionDrafts[step.key] ?? {}} update={(patch) => updateSessionDraft(step.key, patch)} busy={busy} onComplete={(data) => void commit(() => saveSession(step.key, data), () => {
+                  const outcome = data && typeof data === 'object' && 'outcome' in data ? (data as { outcome: unknown }).outcome : undefined;
+                  const validOutcome = outcome === 'done' || outcome === 'partly' || outcome === 'not_today' ? outcome : undefined;
+                  trackSafe('activity_completed', { sessionKey: step.key, ...(validOutcome ? { outcome: validOutcome } : {}) });
+                })} />
               )}
               {step.kind === 'survey' && <SurveyScreen key={step.key} sessionKey={step.key} initial={surveyDrafts[step.key] ?? {}} busy={busy} onChange={(answers) => setSurveyDrafts((previous) => ({ ...previous, [step.key]: answers }))} onSubmit={(answers) => handleSurvey(step.key, answers)} />}
-              {step.kind === 'complete' && <><div className="complete-mark"><IconCheck /></div><p className="eyebrow">Journey complete</p><h1>Thank you for exploring with Eudia.</h1><p className="lead">You completed all six experiences and their check-ins. Your responses have been saved.</p><div className="panel tint"><p className="body-copy">You can close this page now.</p></div></>}
+              {step.kind === 'complete' && <><div className="complete-mark"><IconCheck /></div><p className="eyebrow">Journey complete</p><h1>Thank you for exploring with Eudia.</h1><p className="lead">You completed all six experiences and their check-ins. Your responses have been saved.</p>{launchError ? <div className="panel tint"><p className="body-copy">Completion return is blocked because this link is invalid. Reopen the study from Prolific or contact the study team.</p></div> : prolificParticipant ? completionUrl ? <a className="btn completion-link" href={completionUrl} onClick={(event) => void handleCompletionClick(event)} aria-disabled={redirecting}>{redirecting ? 'Returning to Prolific…' : 'Return to Prolific'}</a> : <div className="panel tint"><p className="body-copy">Prolific completion link is not configured yet. Keep this page open and contact the study team for completion instructions.</p></div> : <div className="panel tint"><p className="body-copy">Preview complete. This run is not linked to a Prolific submission.</p></div>}</>}
             </div>
           </main>
           <aside className="content-side" aria-label="Study overview">
@@ -467,7 +511,7 @@ export default function App() {
                 return <li key={label} className={done ? 'done' : currentGroup === index ? 'current' : ''}><span className="side-dot">{done ? '✓' : index + 3}</span>{label}</li>;
               })}
             </ul></div>
-            <div className="card side-card eudia-side"><img src={avatarUrl} alt="" /><p>Take your time. Your progress stays here if you leave and come back.</p></div>
+            <div className="card side-card eudia-side"><img src={avatarUrl} alt="" /><p>Take your time. Return with this browser to continue your saved progress.</p></div>
           </aside>
         </div>
       </div>
@@ -483,6 +527,7 @@ export default function App() {
         <p className="lead">We’ll begin with your best possible self, then look back at yesterday and try a few short experiences together.</p>
         <div className="hero-illustration"><img src={avatarUrl} alt="Eudia, your reflection companion" /></div>
         <EudiaMessage><p>Hii, I’m Eudia. Let’s start with the person you hope to become. There are no perfect answers here.</p></EudiaMessage>
+        <div className="panel soft-blue"><p className="body-copy">Please leave out names, contact details, and other identifying details when you write about yourself or your calendar.</p></div>
         <div className="actions"><button className="btn" onClick={() => setOnboardingStage('imagery')}>Begin</button></div>
       </>;
       case 'imagery': return <>
@@ -502,6 +547,7 @@ export default function App() {
         <p className="eyebrow">Best possible self · write</p>
         <h2>Put that future into your own words.</h2>
         <p className="lead">Imagine life a few years from now. Describe what matters in your work, leisure, relationships, and growth.</p>
+        <p className="privacy-note">Please avoid names, contact details, and other identifying details.</p>
         <label className="field"><span className="field-label">Your best possible self</span><span className="field-hint">Write as much as you need. Details help Eudia understand your direction.</span><textarea className="textarea lined" value={onboarding.essay} onChange={(event) => setOnboarding((previous) => ({ ...previous, essay: event.target.value }))} placeholder="In the life I’m building, I…" /></label>
         <div className="actions"><button className="btn" disabled={!onboarding.essay.trim() || busy} onClick={() => void handleCategorize()}>{busy ? 'Organizing…' : 'Continue'}</button><button className="btn ghost" onClick={() => setOnboardingStage('imagery')}>Back</button></div>
       </>;
@@ -521,15 +567,16 @@ export default function App() {
       <p className="eyebrow">{calendarDay === yesterdayDateKey() ? 'Yesterday’s calendar' : `Calendar for ${dayLabel(calendarDay)}`}</p>
       <h2>What filled your day?</h2>
       <p className="lead">Add the events you remember from {dayLabel(calendarDay)}. You’ll use this same list for both reflection activities.</p>
+      <p className="privacy-note">Use general event titles. Please leave out names, addresses, and contact details.</p>
       <EudiaMessage><p>A meal, a conversation, work, a quiet moment—anything that felt part of your day can go here.</p></EudiaMessage>
       {calendarDraft.length > 0 && <div className="event-list" style={{ marginBottom: 25 }}>{calendarDraft.map((event) => <div className="event-card" key={event.id}><span className="event-icon" aria-hidden="true">▦</span><span className="event-info"><strong>{event.title}</strong><span>{clockTime(event.start)}–{clockTime(event.end)}</span></span><button className="btn ghost small" aria-label={`Edit ${event.title}`} onClick={() => editEvent(event)}>Edit</button><button className="event-remove" aria-label={`Remove ${event.title}`} onClick={() => setCalendarDraft((previous) => previous.filter((item) => item.id !== event.id))}>×</button></div>)}</div>}
       <div className="panel"><h3>{editingEventId ? 'Edit event' : 'Add an event'}</h3><p className="body-copy" style={{ marginTop: 0 }}>Only a title and time needed. Add as many as you want.</p>
-        <label className="field"><span className="field-label">What happened?</span><input className="text-input" value={eventTitle} onChange={(event) => setEventTitle(event.target.value)} placeholder="For example, lunch with Maya" /></label>
+        <label className="field"><span className="field-label">What happened?</span><input className="text-input" value={eventTitle} onChange={(event) => setEventTitle(event.target.value)} placeholder="For example, lunch with a friend" /></label>
         <div className="two-cols"><label className="field"><span className="field-label">Start</span><input className="text-input" type="time" value={eventStart} onChange={(event) => setEventStart(event.target.value)} /></label><label className="field"><span className="field-label">End</span><input className="text-input" type="time" value={eventEnd} onChange={(event) => setEventEnd(event.target.value)} /></label></div>
         <label className="field"><span className="field-label">Notes <span className="muted small">Optional</span></span><input className="text-input" value={eventNotes} onChange={(event) => setEventNotes(event.target.value)} placeholder="Anything you want to remember" /></label>
         {eventError && <p className="field-error" role="alert">{eventError}</p>}<button className="btn secondary small" onClick={addEvent}>{editingEventId ? 'Save changes' : 'Add event'}</button>{editingEventId && <button className="btn ghost small" onClick={() => { setEditingEventId(null); setEventTitle(''); setEventNotes(''); }}>Cancel</button>}
       </div>
-      <div className="actions"><button className="btn" disabled={!calendarDraft.length || busy} onClick={() => void commit(() => saveCalendarEvents(calendarDraft))}>{busy ? 'Saving…' : 'Continue to reflection'}</button></div>
+      <div className="actions"><button className="btn" disabled={!calendarDraft.length || busy} onClick={() => void commit(() => saveCalendarEvents(calendarDraft), () => trackSafe('calendar_saved', { count: calendarDraft.length }))}>{busy ? 'Saving…' : 'Continue to reflection'}</button></div>
     </>;
   }
 }
@@ -642,12 +689,17 @@ function PhilosophyActive({ profile, draft, update, busy, onComplete }: {
   useEffect(() => {
     if (savedRecommendation || selectedId || phase !== 'choose') return;
     let cancelled = false;
+    const startedAt = performance.now();
     void recommendPhilosopher(profile).then((result) => {
       if (cancelled) return;
       setRecommendation(result);
       update({ recommendation: result });
+      trackAi('recommend_philosopher', 'success', startedAt);
     }).catch((cause) => {
-      if (!cancelled) setLocalError(`Eudia could not suggest a philosopher. You can choose one below. ${errorText(cause)}`);
+      if (!cancelled) {
+        trackAi('recommend_philosopher', 'error', startedAt);
+        setLocalError(`Eudia could not suggest a philosopher. You can choose one below. ${errorText(cause)}`);
+      }
     }).finally(() => { if (!cancelled) setRecommending(false); });
     return () => { cancelled = true; };
   }, [profile.essay]);
@@ -656,10 +708,12 @@ function PhilosophyActive({ profile, draft, update, busy, onComplete }: {
   const beginChat = async () => {
     if (!selected) return;
     setSending(true); setLocalError('');
+    const startedAt = performance.now();
     try {
       const result = await runPhilosophy({ philosopher: selected.id, messages: [], profile });
+      trackAi('philosophy_turn', 'success', startedAt);
       update({ phase: 'chat', messages: [{ role: 'assistant', content: result.reply }] });
-    } catch (cause) { setLocalError(errorText(cause)); }
+    } catch (cause) { trackAi('philosophy_turn', 'error', startedAt); setLocalError(errorText(cause)); }
     finally { setSending(false); }
   };
   const sendTurn = async () => {
@@ -667,10 +721,12 @@ function PhilosophyActive({ profile, draft, update, busy, onComplete }: {
     const next: ChatMessage[] = [...messages, { role: 'user', content: input.trim() }];
     update({ messages: next, input: '' });
     setSending(true); setLocalError('');
+    const startedAt = performance.now();
     try {
       const result = await runPhilosophy({ philosopher: selected.id, messages: next, profile });
+      trackAi('philosophy_turn', 'success', startedAt);
       update({ messages: [...next, { role: 'assistant', content: result.reply }] });
-    } catch (cause) { update({ messages, input }); setLocalError(errorText(cause)); }
+    } catch (cause) { trackAi('philosophy_turn', 'error', startedAt); update({ messages, input }); setLocalError(errorText(cause)); }
     finally { setSending(false); }
   };
   const education = selectedId === recommendation?.id ? recommendation.education : selected?.education;
@@ -749,9 +805,9 @@ function ChallengeBaseline({ state, draft, update, busy, onComplete }: {
       <label className="field"><span className="field-label">What personal value could guide you here?</span><input className="text-input" value={value} onChange={(event) => update({ value: event.target.value })} placeholder="For example, curiosity or care" /></label>
       <div className="choice-grid"><div className="choice-card away"><strong>Away from what matters</strong><p>What familiar reaction might pull you away?</p><textarea className="textarea" style={{ marginTop: 12 }} value={away} onChange={(event) => update({ away: event.target.value })} placeholder="I might…" /></div><div className="choice-card toward"><strong>Toward what matters</strong><p>What would a step in your chosen direction look like?</p><textarea className="textarea" style={{ marginTop: 12 }} value={toward} onChange={(event) => update({ toward: event.target.value })} placeholder="I could…" /></div></div>
       <label className="field"><span className="field-label">Choose your own five-minute action</span><span className="field-hint">Make it small enough to start now.</span><input className="text-input" value={action} onChange={(event) => update({ action: event.target.value })} placeholder="For the next five minutes, I will…" /></label>
-      <div className="actions"><button className="btn" disabled={!goal.trim() || !situation.trim() || !value.trim() || !away.trim() || !toward.trim() || !action.trim()} onClick={() => update({ phase: 'doing', startedAt: Date.now() })}>Start five minutes</button></div>
+      <div className="actions"><button className="btn" disabled={!goal.trim() || !situation.trim() || !value.trim() || !away.trim() || !toward.trim() || !action.trim()} onClick={() => { update({ phase: 'doing', startedAt: Date.now() }); trackSafe('challenge_started', { sessionKey: 'challenge_baseline' }); }}>Start five minutes</button></div>
     </>}
-    {phase === 'doing' && <ActionWindow action={action} startedAt={startedAt} onReturn={() => update({ phase: 'checkin', returnedAt: Date.now() })} />}
+    {phase === 'doing' && <ActionWindow action={action} startedAt={startedAt} onReturn={() => { const returned = Date.now(); update({ phase: 'checkin', returnedAt: returned }); trackSafe('challenge_returned', { sessionKey: 'challenge_baseline', elapsedSeconds: trackedElapsedSeconds(startedAt, returned) }); }} />}
     {phase === 'checkin' && <ActionCheckin outcome={outcome} note={note} onOutcome={(value) => update({ outcome: value })} onNote={(value) => update({ note: value })} onFinish={() => onComplete({ goal: goal.trim(), situation: situation.trim(), value: value.trim(), away: away.trim(), toward: toward.trim(), action: action.trim(), startedAt: new Date(startedAt).toISOString(), returnedAt: new Date(returnedAt || Date.now()).toISOString(), outcome, note: note.trim() })} busy={busy} />}
   </>;
 }
@@ -775,10 +831,12 @@ function ChallengeActive({ state, draft, update, busy, onComplete }: {
   const requestChallenge = async () => {
     if (!goal.trim() || !situation.trim()) return;
     setGenerating(true); setLocalError('');
+    const startedAt = performance.now();
     try {
       const generated = await generateChallenge({ goal: goal.trim(), situation: situation.trim(), profile: state.onboarding! });
+      trackAi('generate_challenge', 'success', startedAt);
       update({ proposal: generated, action: generated.action, phase: 'proposal' });
-    } catch (cause) { setLocalError(errorText(cause)); }
+    } catch (cause) { trackAi('generate_challenge', 'error', startedAt); setLocalError(errorText(cause)); }
     finally { setGenerating(false); }
   };
   return <>
@@ -793,9 +851,9 @@ function ChallengeActive({ state, draft, update, busy, onComplete }: {
     {phase === 'proposal' && proposal && <>
       <div className="challenge-card"><p className="prompt-meta">EUDIA’S CHALLENGE FOR YOU</p><h3>{proposal.title}</h3><p>{proposal.action}</p><div className="callout"><span className="callout-icon">✦</span><span>{proposal.why}</span></div></div>
       <label className="field"><span className="field-label">Make it fit your moment</span><span className="field-hint">You can adjust the action before you begin.</span><textarea className="textarea" value={action} onChange={(event) => update({ action: event.target.value })} /></label>
-      <div className="actions"><button className="btn" disabled={!action.trim()} onClick={() => update({ phase: 'doing', startedAt: Date.now() })}>Start five minutes</button><button className="btn secondary" disabled={generating} onClick={() => void requestChallenge()}>Try another idea</button></div>
+      <div className="actions"><button className="btn" disabled={!action.trim()} onClick={() => { update({ phase: 'doing', startedAt: Date.now() }); trackSafe('challenge_started', { sessionKey: 'challenge_active' }); }}>Start five minutes</button><button className="btn secondary" disabled={generating} onClick={() => void requestChallenge()}>Try another idea</button></div>
     </>}
-    {phase === 'doing' && <ActionWindow action={action} startedAt={startedAt} onReturn={() => update({ phase: 'checkin', returnedAt: Date.now() })} />}
+    {phase === 'doing' && <ActionWindow action={action} startedAt={startedAt} onReturn={() => { const returned = Date.now(); update({ phase: 'checkin', returnedAt: returned }); trackSafe('challenge_returned', { sessionKey: 'challenge_active', elapsedSeconds: trackedElapsedSeconds(startedAt, returned) }); }} />}
     {phase === 'checkin' && <ActionCheckin outcome={outcome} note={note} onOutcome={(value) => update({ outcome: value })} onNote={(value) => update({ note: value })} onFinish={() => onComplete({ goal: goal.trim(), situation: situation.trim(), proposal, action: action.trim(), startedAt: new Date(startedAt).toISOString(), returnedAt: new Date(returnedAt || Date.now()).toISOString(), outcome, note: note.trim() })} busy={busy} />}
   </>;
 }

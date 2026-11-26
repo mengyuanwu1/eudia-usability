@@ -1,5 +1,5 @@
 import { getApp, getApps, initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
+import { getAuth, onAuthStateChanged, signInAnonymously, signOut, type User } from 'firebase/auth';
 import { getFunctions, httpsCallable } from 'firebase/functions';
 
 export const DOMAINS = [
@@ -62,6 +62,46 @@ export interface StudyState {
   onboarding?: ParticipantProfile;
   calendarEvents: CalendarEvent[];
   sessions: Partial<Record<SessionKey, StudySession>>;
+  launchContext?: StoredLaunchContext;
+}
+
+export interface LaunchContext {
+  prolificPid?: string;
+  studyId?: string;
+  sessionId?: string;
+  source: 'prolific' | 'preview';
+  error?: string;
+}
+
+export interface StoredLaunchContext extends LaunchContext {
+  verified: false;
+  capturedAt: string;
+}
+
+export type StudyEventName =
+  | 'study_screen_view'
+  | 'activity_started'
+  | 'activity_completed'
+  | 'survey_submitted'
+  | 'calendar_saved'
+  | 'onboarding_saved'
+  | 'ai_request'
+  | 'challenge_started'
+  | 'challenge_returned'
+  | 'completion_redirect'
+  | 'study_resumed'
+  | 'visibility_changed';
+
+export interface StudyEventMetadata {
+  screen?: 'signin' | 'onboarding' | 'onboarding_intro' | 'onboarding_imagery' |
+    'onboarding_essay' | 'onboarding_domains' | 'calendar' | 'session' | 'survey' | 'complete';
+  sessionKey?: SessionKey;
+  count?: number;
+  operation?: 'categorize_bps' | 'recommend_philosopher' | 'philosophy_turn' | 'generate_challenge';
+  outcome?: 'success' | 'error' | 'done' | 'partly' | 'not_today';
+  visibility?: 'visible' | 'hidden';
+  latencyMs?: number;
+  elapsedSeconds?: number;
 }
 
 export interface ChatMessage {
@@ -125,6 +165,69 @@ export const getPhilosophers = (): Philosopher[] => PHILOSOPHERS;
 const backendMode =
   import.meta.env.VITE_STUDY_BACKEND_MODE ?? (import.meta.env.DEV ? 'demo' : 'firebase');
 const STORAGE_KEY = 'eudia-study-web-v1';
+const LAUNCH_KEY = 'eudia-study-prolific-launch-v1';
+
+function launchValue(value: string | null): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed && /^[A-Za-z0-9_-]{1,128}$/.test(trimmed) ? trimmed : undefined;
+}
+
+function validProlificPid(value: string | null): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed && /^[A-Za-z0-9]{24}$/.test(trimmed) ? trimmed : undefined;
+}
+
+function captureLaunchContext(): LaunchContext {
+  if (typeof window === 'undefined') return { source: 'preview' };
+  const url = new URL(window.location.href);
+  const names = ['PROLIFIC_PID', 'STUDY_ID', 'SESSION_ID'] as const;
+  const hasQuery = names.some((name) => url.searchParams.has(name));
+  if (hasQuery) {
+    const prolificPid = validProlificPid(url.searchParams.get('PROLIFIC_PID'));
+    const studyId = launchValue(url.searchParams.get('STUDY_ID'));
+    const sessionId = launchValue(url.searchParams.get('SESSION_ID'));
+    const optionalIdsValid =
+      (!url.searchParams.has('STUDY_ID') || !!studyId) &&
+      (!url.searchParams.has('SESSION_ID') || !!sessionId);
+    const context: LaunchContext = prolificPid && optionalIdsValid
+      ? { prolificPid, ...(studyId ? { studyId } : {}),
+          ...(sessionId ? { sessionId } : {}), source: 'prolific' }
+      : { source: 'preview', error: 'Invalid Prolific participant link.' };
+    if (context.source === 'prolific') {
+      sessionStorage.setItem(LAUNCH_KEY, JSON.stringify(context));
+    } else {
+      sessionStorage.removeItem(LAUNCH_KEY);
+    }
+    for (const name of names) url.searchParams.delete(name);
+    window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+    return context;
+  }
+  try {
+    const raw = sessionStorage.getItem(LAUNCH_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const prolificPid = validProlificPid(
+        typeof parsed.prolificPid === 'string' ? parsed.prolificPid : null,
+      );
+      const context: LaunchContext = {
+        prolificPid,
+        studyId: launchValue(typeof parsed.studyId === 'string' ? parsed.studyId : null),
+        sessionId: launchValue(typeof parsed.sessionId === 'string' ? parsed.sessionId : null),
+        source: 'prolific',
+      };
+      if (prolificPid) return context;
+      sessionStorage.removeItem(LAUNCH_KEY);
+    }
+  } catch {
+    // Invalid cached launch metadata is ignored; no raw URL is retained.
+  }
+  return { source: 'preview' };
+}
+
+const launchContext = captureLaunchContext();
+export function getLaunchContext(): LaunchContext {
+  return { ...launchContext };
+}
 const emptyState = (): StudyState => ({
   protocolVersion: 1,
   calendarEvents: [],
@@ -141,6 +244,7 @@ function demoState(): StudyState {
       onboarding: parsed.onboarding,
       calendarEvents: Array.isArray(parsed.calendarEvents) ? parsed.calendarEvents : [],
       sessions: parsed.sessions ?? {},
+      launchContext: parsed.launchContext,
     };
   } catch {
     return emptyState();
@@ -175,28 +279,38 @@ function publicUser(user: User): StudyUser {
   };
 }
 
+let resolvingUser: Promise<StudyUser | null> | null = null;
+
 export async function getCurrentUser(): Promise<StudyUser | null> {
   if (backendMode === 'demo') {
     return { uid: 'demo', displayName: 'Demo participant', email: null, photoURL: null };
   }
-  const auth = authInstance();
-  const user = await new Promise<User | null>((resolve) => {
-    let unsubscribe = () => {};
-    unsubscribe = onAuthStateChanged(auth, (current) => {
-      unsubscribe();
-      resolve(current);
-    }, () => {
-      unsubscribe();
-      resolve(null);
+  if (!resolvingUser) {
+    resolvingUser = (async () => {
+      const auth = authInstance();
+      const user = await new Promise<User | null>((resolve) => {
+        let unsubscribe = () => {};
+        unsubscribe = onAuthStateChanged(auth, (current) => {
+          unsubscribe();
+          resolve(current);
+        }, () => {
+          unsubscribe();
+          resolve(null);
+        });
+      });
+      if (user?.isAnonymous) return publicUser(user);
+      if (user) await signOut(auth);
+      return publicUser((await signInAnonymously(auth)).user);
+    })().finally(() => {
+      resolvingUser = null;
     });
-  });
-  return user ? publicUser(user) : null;
+  }
+  return resolvingUser;
 }
 
 export async function signIn(): Promise<StudyUser> {
   if (backendMode === 'demo') return (await getCurrentUser())!;
-  const result = await signInWithPopup(authInstance(), new GoogleAuthProvider());
-  return publicUser(result.user);
+  return (await getCurrentUser())!;
 }
 
 export async function signOutStudy(): Promise<void> {
@@ -206,7 +320,7 @@ export async function signOutStudy(): Promise<void> {
 
 async function studyUser(): Promise<StudyUser> {
   const user = await getCurrentUser();
-  if (!user) throw new Error('Sign in with Google to continue.');
+  if (!user) throw new Error('Study session could not start. Try reloading.');
   return user;
 }
 
@@ -224,13 +338,29 @@ function cleanState(value: StudyState): StudyState {
     onboarding: value.onboarding,
     calendarEvents: Array.isArray(value.calendarEvents) ? value.calendarEvents : [],
     sessions: value.sessions ?? {},
+    launchContext: value.launchContext,
   };
 }
 
 export async function getStudy(): Promise<StudyState> {
-  if (backendMode === 'demo') return demoState();
-  const state = await callStudy<StudyState>('studyGetState', {});
+  if (backendMode === 'demo') {
+    const state = demoState();
+    if (!state.launchContext && launchContext.source === 'prolific') {
+      state.launchContext = { ...launchContext, verified: false, capturedAt: new Date().toISOString() };
+      saveDemoState(state);
+    }
+    return state;
+  }
+  const state = await callStudy<StudyState>('studyGetState', { launchContext });
   return cleanState(state);
+}
+
+export async function trackEvent(
+  name: StudyEventName,
+  metadata: StudyEventMetadata = {},
+): Promise<void> {
+  if (backendMode === 'demo') return;
+  await callStudy<{ ok: true }>('studyLogEvent', { name, metadata });
 }
 
 export async function saveOnboarding(data: ParticipantProfile): Promise<StudyState> {
