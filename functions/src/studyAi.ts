@@ -2,7 +2,7 @@ import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import { HttpsError, onCall, CallableRequest } from 'firebase-functions/v2/https';
 import { defineSecret } from 'firebase-functions/params';
 import * as logger from 'firebase-functions/logger';
-import OpenAI from 'openai';
+import OpenAI, { toFile } from 'openai';
 
 const openaiKey = defineSecret('OPENAI_KEY');
 const MODEL = 'gpt-4o-mini';
@@ -147,12 +147,13 @@ function parsePhilosopher(raw: unknown): Philosopher {
   return match;
 }
 
-type AiEndpoint = 'categorize' | 'recommend' | 'philosophy' | 'challenge';
+type AiEndpoint = 'categorize' | 'recommend' | 'philosophy' | 'challenge' | 'transcribe';
 const AI_LIMITS: Record<AiEndpoint, number> = {
   categorize: 4,
   recommend: 4,
   philosophy: 20,
   challenge: 4,
+  transcribe: 4,
 };
 
 async function reserveQuota(uid: string, endpoint: AiEndpoint): Promise<void> {
@@ -170,8 +171,10 @@ async function reserveQuota(uid: string, endpoint: AiEndpoint): Promise<void> {
     if (count >= AI_LIMITS[endpoint]) {
       throw new HttpsError('resource-exhausted', 'Study response limit reached.');
     }
-    const globalCount = Number(globalSnapshot.data()?.['count'] ?? 0);
-    if (globalCount >= 100) {
+    const globalField = endpoint === 'transcribe' ? 'transcribeCount' : 'count';
+    const dailyLimit = endpoint === 'transcribe' ? 150 : 500;
+    const globalCount = Number(globalSnapshot.data()?.[globalField] ?? 0);
+    if (!Number.isFinite(globalCount) || globalCount >= dailyLimit) {
       throw new HttpsError('resource-exhausted', 'Study service is busy today. Try later.');
     }
     transaction.set(ref, {
@@ -179,7 +182,7 @@ async function reserveQuota(uid: string, endpoint: AiEndpoint): Promise<void> {
       updatedAt: FieldValue.serverTimestamp(),
     }, { merge: true });
     transaction.set(globalRef, {
-      count: globalCount + 1,
+      [globalField]: globalCount + 1,
       updatedAt: FieldValue.serverTimestamp(),
     }, { merge: true });
   });
@@ -228,6 +231,81 @@ export const studyCategorizeBps = onCall(callableOptions, async (request) => {
     return { domains };
   } catch (error) {
     return fail(error, 'studyCategorizeBps');
+  }
+});
+
+const MAX_AUDIO_BYTES = 4 * 1024 * 1024;
+const AUDIO_FORMATS: Record<string, { extension: string; magic: (bytes: Buffer) => boolean }> = {
+  'audio/webm': {
+    extension: 'webm',
+    magic: (bytes) => bytes.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3])),
+  },
+  'audio/ogg': {
+    extension: 'ogg',
+    magic: (bytes) => bytes.toString('ascii', 0, 4) === 'OggS',
+  },
+  'audio/mp4': {
+    extension: 'mp4',
+    magic: (bytes) => bytes.toString('ascii', 4, 8) === 'ftyp',
+  },
+  'audio/m4a': {
+    extension: 'm4a',
+    magic: (bytes) => bytes.toString('ascii', 4, 8) === 'ftyp',
+  },
+  'audio/x-m4a': {
+    extension: 'm4a',
+    magic: (bytes) => bytes.toString('ascii', 4, 8) === 'ftyp',
+  },
+  'audio/wav': {
+    extension: 'wav',
+    magic: (bytes) => bytes.toString('ascii', 0, 4) === 'RIFF' &&
+      bytes.toString('ascii', 8, 12) === 'WAVE',
+  },
+  'audio/x-wav': {
+    extension: 'wav',
+    magic: (bytes) => bytes.toString('ascii', 0, 4) === 'RIFF' &&
+      bytes.toString('ascii', 8, 12) === 'WAVE',
+  },
+};
+
+function parseAudio(raw: unknown): { bytes: Buffer; mime: string; extension: string } {
+  const data = asObject(raw);
+  const mime = stringField(data['mimeType'], 'audio type', 80, true).toLowerCase();
+  const baseMime = mime.split(';', 1)[0].trim();
+  const format = AUDIO_FORMATS[baseMime];
+  if (!format || (mime.includes(';') &&
+    !/^audio\/(webm|ogg|mp4)\s*;\s*codecs\s*=\s*[a-z0-9.,_-]+$/i.test(mime))) {
+    throw new HttpsError('invalid-argument', 'This recording format is not supported.');
+  }
+  const base64 = data['base64'];
+  if (typeof base64 !== 'string' || !base64 ||
+    base64.length > Math.ceil(MAX_AUDIO_BYTES / 3) * 4 ||
+    base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) {
+    throw new HttpsError('invalid-argument', 'Recording is invalid or exceeds 4 MB.');
+  }
+  const bytes = Buffer.from(base64, 'base64');
+  if (!bytes.length || bytes.length > MAX_AUDIO_BYTES ||
+    bytes.toString('base64') !== base64 || !format.magic(bytes)) {
+    throw new HttpsError('invalid-argument', 'Recording is invalid or exceeds 4 MB.');
+  }
+  return { bytes, mime: baseMime, extension: format.extension };
+}
+
+export const studyTranscribeBps = onCall(callableOptions, async (request) => {
+  const uid = requireUid(request);
+  const { bytes, mime, extension } = parseAudio(request.data);
+  await reserveQuota(uid, 'transcribe');
+  try {
+    const file = await toFile(bytes, `bps-recording.${extension}`, { type: mime });
+    const transcript = await client().audio.transcriptions.create({
+      file,
+      model: 'gpt-transcribe',
+    });
+    const text = transcript.text?.trim();
+    if (!text || text.length > 12000) throw new Error('Invalid transcript');
+    return { text };
+  } catch (error) {
+    return fail(error, 'studyTranscribeBps');
   }
 });
 

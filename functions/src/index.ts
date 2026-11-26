@@ -4,6 +4,7 @@ if (getApps().length === 0) initializeApp();
 
 export {
   studyCategorizeBps,
+  studyTranscribeBps,
   studyRecommendPhilosopher,
   studyPhilosophyTurn,
   studyGenerateChallenge,

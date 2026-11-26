@@ -5,7 +5,7 @@ Standalone web pilot for Best Possible Self onboarding and six short study sessi
 ## Participant flow
 
 1. Open the anonymous study link from Prolific. The app records `PROLIFIC_PID`, `STUDY_ID`, and `SESSION_ID` from its URL.
-2. Imagine and write a Best Possible Self reflection, then review four editable life-domain summaries.
+2. Imagine and type a Best Possible Self reflection, or record one and edit its transcript, then review four editable life-domain summaries.
 3. Enter yesterday's calendar events once.
 4. Complete these fixed-order sessions, with the same four-item survey after every session:
    - Calendar reflection baseline, then affect and meaning reflection
@@ -21,11 +21,15 @@ npm install
 npm run dev
 ```
 
-Local development uses browser-local demo storage and deterministic sample AI replies. It does not call Firebase or OpenAI. Build the production app with `npm run build`.
+Local development uses browser-local demo storage and deterministic sample AI replies. It does not call Firebase or OpenAI, so audio transcription requires the live deployment. Build the production app with `npm run build`.
+
+For a quick walkthrough, open a preview run with `?admin=1`. The **Admin skip** control advances through onboarding, yesterday's calendar, and each activity using clearly marked synthetic responses. It is unavailable on runs linked to a Prolific participant ID. Do not use preview responses in study analysis.
 
 ## Firebase Functions
 
 The `functions/` directory is a separate Firebase codebase named `study`. AI calls require anonymous Firebase authentication and use the existing `OPENAI_KEY` Secret Manager secret. No AI key is sent to the browser. Function code also caps calls per participant and per day.
+
+Best Possible Self audio is recorded in the browser, sent to a short-lived server transcription call, and inserted as editable text before submission. The raw audio is not stored in the study record. The server uses OpenAI's current [file transcription API](https://developers.openai.com/api/docs/guides/speech-to-text).
 
 ```bash
 npm --prefix functions install

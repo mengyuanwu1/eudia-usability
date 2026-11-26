@@ -32,6 +32,7 @@ export interface ParticipantProfile {
   essay: string;
   domains: DomainSummaries;
   goal?: string;
+  adminSkipped?: true;
 }
 
 export interface CalendarEvent {
@@ -40,6 +41,7 @@ export interface CalendarEvent {
   start: string;
   end: string;
   notes?: string;
+  adminSkipped?: true;
 }
 
 export interface SurveyAnswers {
@@ -90,14 +92,16 @@ export type StudyEventName =
   | 'challenge_returned'
   | 'completion_redirect'
   | 'study_resumed'
-  | 'visibility_changed';
+  | 'visibility_changed'
+  | 'admin_skip';
 
 export interface StudyEventMetadata {
   screen?: 'signin' | 'onboarding' | 'onboarding_intro' | 'onboarding_imagery' |
     'onboarding_essay' | 'onboarding_domains' | 'calendar' | 'session' | 'survey' | 'complete';
   sessionKey?: SessionKey;
   count?: number;
-  operation?: 'categorize_bps' | 'recommend_philosopher' | 'philosophy_turn' | 'generate_challenge';
+  operation?: 'categorize_bps' | 'recommend_philosopher' | 'philosophy_turn' |
+    'generate_challenge' | 'transcribe_bps';
   outcome?: 'success' | 'error' | 'done' | 'partly' | 'not_today';
   visibility?: 'visible' | 'hidden';
   latencyMs?: number;
@@ -425,6 +429,34 @@ export async function categorizeBps(essay: string): Promise<DomainSummaries> {
   if (backendMode === 'demo') return demoCategories(essay);
   const result = await callStudy<{ domains: DomainSummaries }>('studyCategorizeBps', { essay });
   return result.domains;
+}
+
+/** Transcribes a short recording in memory. The audio itself is never saved by this app. */
+export async function transcribeBpsAudio(blob: Blob): Promise<string> {
+  const MAX_AUDIO_BYTES = 4 * 1024 * 1024;
+  if (!blob.size || blob.size > MAX_AUDIO_BYTES) {
+    throw new Error('Recordings must be 4 MB or smaller.');
+  }
+  const mimeType = blob.type.toLowerCase();
+  const baseMime = mimeType.split(';', 1)[0].trim();
+  if (!['audio/webm', 'audio/ogg', 'audio/mp4', 'audio/m4a',
+    'audio/x-m4a', 'audio/wav', 'audio/x-wav'].includes(baseMime)) {
+    throw new Error('This recording format is not supported.');
+  }
+  if (backendMode === 'demo') {
+    throw new Error('Audio transcription is available in the live study only.');
+  }
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 32768) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
+  }
+  const result = await callStudy<{ text: string }>('studyTranscribeBps', {
+    base64: btoa(binary),
+    mimeType,
+  });
+  if (!result.text?.trim()) throw new Error('The recording could not be transcribed.');
+  return result.text.trim();
 }
 
 export async function recommendPhilosopher(

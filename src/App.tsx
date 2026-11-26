@@ -16,6 +16,7 @@ import {
   saveSession,
   saveSurvey,
   trackEvent,
+  transcribeBpsAudio,
   type CalendarEvent,
   type ChatMessage,
   type Domain,
@@ -138,7 +139,7 @@ function trackSafe(name: Parameters<typeof trackEvent>[0], metadata?: Parameters
   void trackEvent(name, metadata).catch(() => {});
 }
 
-function trackAi(operation: 'categorize_bps' | 'recommend_philosopher' | 'philosophy_turn' | 'generate_challenge', outcome: 'success' | 'error', startedAt: number): void {
+function trackAi(operation: 'categorize_bps' | 'recommend_philosopher' | 'philosophy_turn' | 'generate_challenge' | 'transcribe_bps', outcome: 'success' | 'error', startedAt: number): void {
   trackSafe('ai_request', { operation, outcome, latencyMs: Math.min(120000, Math.max(0, Math.round(performance.now() - startedAt))) });
 }
 
@@ -168,6 +169,174 @@ function EudiaMessage({ children }: { children: React.ReactNode }) {
       <div className="eudia-bubble">{children}</div>
     </div>
   );
+}
+
+function BpsAudioRecorder({ onTranscript, onBusyChange }: {
+  onTranscript: (text: string) => void;
+  onBusyChange: (busy: boolean) => void;
+}) {
+  const [status, setStatus] = useState<'idle' | 'requesting' | 'recording' | 'transcribing'>('idle');
+  const [seconds, setSeconds] = useState(0);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const elapsedTimerRef = useRef<number | null>(null);
+  const limitTimerRef = useRef<number | null>(null);
+  const startedAtRef = useRef(0);
+  const cancelledRef = useRef(false);
+  const tooLargeRef = useRef(false);
+  const mountedRef = useRef(true);
+  const requestIdRef = useRef(0);
+  const maxBytes = 4 * 1024 * 1024;
+  const supported = typeof MediaRecorder !== 'undefined' && !!navigator.mediaDevices?.getUserMedia;
+
+  const setPhase = (next: typeof status) => {
+    if (!mountedRef.current) return;
+    setStatus(next);
+    onBusyChange(next !== 'idle');
+  };
+  const clearTimers = () => {
+    if (elapsedTimerRef.current !== null) window.clearInterval(elapsedTimerRef.current);
+    if (limitTimerRef.current !== null) window.clearTimeout(limitTimerRef.current);
+    elapsedTimerRef.current = null;
+    limitTimerRef.current = null;
+  };
+  const releaseStream = () => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      cancelledRef.current = true;
+      requestIdRef.current += 1;
+      clearTimers();
+      if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
+      recorderRef.current = null;
+      releaseStream();
+      chunksRef.current = [];
+      onBusyChange(false);
+    };
+  }, []);
+
+  const start = async () => {
+    if (!supported || status !== 'idle') return;
+    setError(''); setMessage(''); setSeconds(0);
+    cancelledRef.current = false;
+    tooLargeRef.current = false;
+    chunksRef.current = [];
+    const requestId = ++requestIdRef.current;
+    setPhase('requesting');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (cancelledRef.current || !mountedRef.current || requestId !== requestIdRef.current) { stream.getTracks().forEach((track) => track.stop()); return; }
+      streamRef.current = stream;
+      const mimeType = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg;codecs=opus']
+        .find((type) => MediaRecorder.isTypeSupported(type));
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recorderRef.current = recorder;
+      recorder.ondataavailable = (event) => {
+        if (requestId !== requestIdRef.current) return;
+        if (!event.data.size) return;
+        chunksRef.current.push(event.data);
+        if (chunksRef.current.reduce((sum, chunk) => sum + chunk.size, 0) > maxBytes && recorder.state === 'recording') {
+          tooLargeRef.current = true;
+          recorder.stop();
+        }
+      };
+      recorder.onerror = () => {
+        if (requestId !== requestIdRef.current || !mountedRef.current) return;
+        cancelledRef.current = true;
+        if (recorder.state === 'recording') recorder.stop();
+        clearTimers();
+        releaseStream();
+        recorderRef.current = null;
+        chunksRef.current = [];
+        setError('Recording failed. Please try again or type your answer.'); setPhase('idle');
+      };
+      recorder.onstop = () => {
+        if (requestId !== requestIdRef.current) return;
+        clearTimers();
+        releaseStream();
+        recorderRef.current = null;
+        if (cancelledRef.current || !mountedRef.current) { chunksRef.current = []; return; }
+        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || chunksRef.current[0]?.type || 'audio/webm' });
+        chunksRef.current = [];
+        if (tooLargeRef.current || blob.size > maxBytes) {
+          setError('Recording reached the 4 MB limit. Please try a shorter answer or type it.');
+          setPhase('idle');
+          return;
+        }
+        if (!blob.size) { setError('No audio was captured. Please try again.'); setPhase('idle'); return; }
+        setPhase('transcribing');
+        const transcribeStartedAt = performance.now();
+        void transcribeBpsAudio(blob).then((transcript) => {
+          if (!mountedRef.current) return;
+          if (!transcript.trim()) throw new Error('No speech was detected. Please try again or type your answer.');
+          trackAi('transcribe_bps', 'success', transcribeStartedAt);
+          onTranscript(transcript.trim());
+          setMessage('Transcript added below. You can edit it before continuing.');
+        }).catch((cause) => {
+          if (mountedRef.current) { trackAi('transcribe_bps', 'error', transcribeStartedAt); setError(errorText(cause)); }
+        }).finally(() => {
+          if (mountedRef.current) setPhase('idle');
+        });
+      };
+      recorder.start(1000);
+      startedAtRef.current = Date.now();
+      setPhase('recording');
+      elapsedTimerRef.current = window.setInterval(() => {
+        if (requestId !== requestIdRef.current) return;
+        const elapsed = Math.floor((Date.now() - startedAtRef.current) / 1000);
+        setSeconds(Math.min(120, elapsed));
+        if (elapsed >= 120 && recorder.state === 'recording') recorder.stop();
+      }, 250);
+      limitTimerRef.current = window.setTimeout(() => { if (requestId === requestIdRef.current && recorder.state === 'recording') recorder.stop(); }, 120000);
+    } catch (cause) {
+      if (requestId !== requestIdRef.current || !mountedRef.current) return;
+      releaseStream();
+      const reason = cause instanceof DOMException && cause.name === 'NotAllowedError'
+        ? 'Microphone access was blocked. Allow microphone access in your browser or type your answer.'
+        : `Could not start recording. ${errorText(cause)}`;
+      if (mountedRef.current) { setError(reason); setPhase('idle'); }
+    }
+  };
+
+  const stop = () => {
+    const recorder = recorderRef.current;
+    if (!recorder || recorder.state !== 'recording') return;
+    setPhase('transcribing');
+    recorder.stop();
+  };
+  const cancel = () => {
+    cancelledRef.current = true;
+    requestIdRef.current += 1;
+    clearTimers();
+    if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
+    recorderRef.current = null;
+    releaseStream();
+    chunksRef.current = [];
+    setPhase('idle');
+    setMessage('Recording discarded.');
+  };
+
+  return <div className="audio-recorder">
+    <div className="audio-recorder-copy"><strong>Prefer to speak?</strong><span>Recording is transcribed when you stop. Review the editable text before continuing.</span></div>
+    {!supported ? <p className="audio-status">Audio recording is unavailable in this browser. You can type your answer.</p> : <>
+      <div className="audio-controls">
+        {status === 'idle' && <button type="button" className="btn secondary" onClick={() => void start()}><span aria-hidden="true">🎙</span> Record answer</button>}
+        {status === 'requesting' && <><span className="audio-status">Waiting for microphone permission…</span><button type="button" className="btn ghost small" onClick={cancel}>Cancel</button></>}
+        {status === 'recording' && <><span className="recording-indicator"><span className="recording-dot" />Recording {minutesAndSeconds(seconds)} / 2:00</span><button type="button" className="btn" onClick={stop}>Stop and transcribe</button><button type="button" className="btn ghost small" onClick={cancel}>Cancel</button></>}
+        {status === 'transcribing' && <><span className="spinner audio-spinner" aria-hidden="true" /><span className="audio-status">Turning speech into text…</span></>}
+      </div>
+    </>}
+    {message && <p className="audio-success" role="status">{message}</p>}
+    {error && <p className="field-error" role="alert">{error}</p>}
+  </div>;
 }
 
 function RatingScale({
@@ -258,20 +427,21 @@ function SurveyScreen({ sessionKey, initial, busy, onChange, onSubmit }: {
 }
 
 function SessionContent({
-  sessionKey, state, draft, update, busy, onComplete,
+  sessionKey, state, draft, update, busy, skipMode, onComplete,
 }: {
   sessionKey: SessionKey;
   state: StudyState;
   draft: Record<string, unknown>;
   update: (patch: Record<string, unknown>) => void;
   busy: boolean;
+  skipMode: boolean;
   onComplete: (data: unknown) => void;
 }) {
   switch (sessionKey) {
     case 'reflection_baseline': return <ReflectionBaseline state={state} draft={draft} update={update} busy={busy} onComplete={onComplete} />;
     case 'reflection_active': return <ReflectionActive state={state} draft={draft} update={update} busy={busy} onComplete={onComplete} />;
     case 'philosophy_baseline': return <PhilosophyBaseline draft={draft} update={update} busy={busy} onComplete={onComplete} />;
-    case 'philosophy_active': return <PhilosophyActive profile={state.onboarding!} draft={draft} update={update} busy={busy} onComplete={onComplete} />;
+    case 'philosophy_active': return <PhilosophyActive profile={state.onboarding!} draft={draft} update={update} busy={busy} skipMode={skipMode} onComplete={onComplete} />;
     case 'challenge_baseline': return <ChallengeBaseline state={state} draft={draft} update={update} busy={busy} onComplete={onComplete} />;
     case 'challenge_active': return <ChallengeActive state={state} draft={draft} update={update} busy={busy} onComplete={onComplete} />;
   }
@@ -284,6 +454,7 @@ export default function App() {
   const [loadError, setLoadError] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [audioBusy, setAudioBusy] = useState(false);
   const [onboardingStage, setOnboardingStage] = useStoredState<OnboardingStage>('eudia-study-onboarding-stage', 'intro');
   const [onboarding, setOnboarding] = useStoredState<OnboardingDraft>('eudia-study-onboarding-draft', {
     essay: '', domains: emptyDomains(), goal: '', imageryEndsAt: null,
@@ -301,6 +472,7 @@ export default function App() {
   const [editingEventId, setEditingEventId] = useState<string | null>(null);
   const lastTrackedStep = useRef('');
   const startupStarted = useRef(false);
+  const adminSkipInFlight = useRef(false);
   const [redirecting, setRedirecting] = useState(false);
 
   const ensureDraftOwner = (uid: string) => {
@@ -453,6 +625,60 @@ export default function App() {
   const paidRun = storedLaunch?.source === 'prolific' && /^[A-Za-z0-9]{24}$/.test(storedLaunch.prolificPid ?? '');
   const prolificParticipant = paidRun && !launchError;
   const completionUrl = safeProlificCompletionUrl(import.meta.env.VITE_PROLIFIC_COMPLETION_URL);
+  const adminRequested = new URLSearchParams(window.location.search).get('admin') === '1';
+  const adminCanSkip = adminRequested && storedLaunch?.source !== 'prolific' && launch?.source !== 'prolific' && !launchError && step.kind !== 'complete';
+
+  const handleAdminSkip = async () => {
+    if (!adminCanSkip || !study || busy || audioBusy || adminSkipInFlight.current) return;
+    adminSkipInFlight.current = true;
+    setBusy(true);
+    setError('');
+    try {
+      let next: StudyState;
+      if (step.kind === 'onboarding') {
+        const profile: ParticipantProfile = {
+          essay: 'Preview admin skip: synthetic Best Possible Self response for interface testing.',
+          domains: Object.fromEntries(DOMAINS.map((domain) => [domain, `Synthetic preview summary for ${domain}.`])) as DomainSummaries,
+          goal: 'Try one small meaningful action',
+          adminSkipped: true,
+        };
+        next = await saveOnboarding(profile);
+        setStudy(next);
+        trackSafe('admin_skip', { screen: 'onboarding' });
+      } else if (step.kind === 'calendar') {
+        const day = yesterdayDateKey();
+        const event: CalendarEvent = {
+          id: 'preview-admin-yesterday-event',
+          title: 'Preview calendar event',
+          start: new Date(`${day}T12:00:00`).toISOString(),
+          end: new Date(`${day}T12:30:00`).toISOString(),
+          adminSkipped: true,
+        };
+        next = await saveCalendarEvents([event]);
+        setStudy(next);
+        trackSafe('admin_skip', { screen: 'calendar' });
+      } else if (step.kind === 'session') {
+        next = await saveSession(step.key, { adminSkipped: true, preview: true, sessionKey: step.key });
+        setStudy(next);
+        next = await saveSurvey(step.key, {
+          helpful: 4, relevant: 4, clarity: 4, motivation: 4, comment: 'Preview admin skip',
+        });
+        setStudy(next);
+        trackSafe('admin_skip', { screen: 'session', sessionKey: step.key });
+      } else if (step.kind === 'survey') {
+        next = await saveSurvey(step.key, {
+          helpful: 4, relevant: 4, clarity: 4, motivation: 4, comment: 'Preview admin skip',
+        });
+        setStudy(next);
+        trackSafe('admin_skip', { screen: 'survey', sessionKey: step.key });
+      }
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy(false);
+      adminSkipInFlight.current = false;
+    }
+  };
 
   const handleCompletionClick = async (event: React.MouseEvent<HTMLAnchorElement>) => {
     if (!completionUrl || redirecting) { event.preventDefault(); return; }
@@ -485,6 +711,7 @@ export default function App() {
           <div className="progress-track"><div className="progress-fill" style={{ width: `${progress}%` }} /></div>
           <span className="progress-count">{completedSessions} / 6 done</span>
         </div>
+        {adminCanSkip && <div className="admin-toolbar"><span><strong>Preview admin</strong> · saves synthetic data for this phase</span><button className="admin-skip-button" disabled={busy || audioBusy} onClick={() => void handleAdminSkip()}>{busy ? 'Skipping…' : 'Skip this phase'}</button></div>}
         <div className="content-layout">
           <main id="main" className="content-main">
             <div className="card main-card">
@@ -492,7 +719,7 @@ export default function App() {
               {step.kind === 'onboarding' && renderOnboarding()}
               {step.kind === 'calendar' && renderCalendar()}
               {step.kind === 'session' && (
-                <SessionContent key={step.key} sessionKey={step.key} state={study} draft={sessionDrafts[step.key] ?? {}} update={(patch) => updateSessionDraft(step.key, patch)} busy={busy} onComplete={(data) => void commit(() => saveSession(step.key, data), () => {
+                <SessionContent key={step.key} sessionKey={step.key} state={study} draft={sessionDrafts[step.key] ?? {}} update={(patch) => updateSessionDraft(step.key, patch)} busy={busy} skipMode={adminCanSkip} onComplete={(data) => void commit(() => saveSession(step.key, data), () => {
                   const outcome = data && typeof data === 'object' && 'outcome' in data ? (data as { outcome: unknown }).outcome : undefined;
                   const validOutcome = outcome === 'done' || outcome === 'partly' || outcome === 'not_today' ? outcome : undefined;
                   trackSafe('activity_completed', { sessionKey: step.key, ...(validOutcome ? { outcome: validOutcome } : {}) });
@@ -527,7 +754,6 @@ export default function App() {
         <p className="lead">We’ll begin with your best possible self, then look back at yesterday and try a few short experiences together.</p>
         <div className="hero-illustration"><img src={avatarUrl} alt="Eudia, your reflection companion" /></div>
         <EudiaMessage><p>Hii, I’m Eudia. Let’s start with the person you hope to become. There are no perfect answers here.</p></EudiaMessage>
-        <div className="panel soft-blue"><p className="body-copy">Please leave out names, contact details, and other identifying details when you write about yourself or your calendar.</p></div>
         <div className="actions"><button className="btn" onClick={() => setOnboardingStage('imagery')}>Begin</button></div>
       </>;
       case 'imagery': return <>
@@ -547,9 +773,9 @@ export default function App() {
         <p className="eyebrow">Best possible self · write</p>
         <h2>Put that future into your own words.</h2>
         <p className="lead">Imagine life a few years from now. Describe what matters in your work, leisure, relationships, and growth.</p>
-        <p className="privacy-note">Please avoid names, contact details, and other identifying details.</p>
         <label className="field"><span className="field-label">Your best possible self</span><span className="field-hint">Write as much as you need. Details help Eudia understand your direction.</span><textarea className="textarea lined" value={onboarding.essay} onChange={(event) => setOnboarding((previous) => ({ ...previous, essay: event.target.value }))} placeholder="In the life I’m building, I…" /></label>
-        <div className="actions"><button className="btn" disabled={!onboarding.essay.trim() || busy} onClick={() => void handleCategorize()}>{busy ? 'Organizing…' : 'Continue'}</button><button className="btn ghost" onClick={() => setOnboardingStage('imagery')}>Back</button></div>
+        <BpsAudioRecorder onBusyChange={setAudioBusy} onTranscript={(text) => setOnboarding((previous) => ({ ...previous, essay: previous.essay.trim() ? `${previous.essay.trimEnd()}\n\n${text}` : text }))} />
+        <div className="actions"><button className="btn" disabled={!onboarding.essay.trim() || busy || audioBusy} onClick={() => void handleCategorize()}>{busy ? 'Organizing…' : 'Continue'}</button><button className="btn ghost" disabled={audioBusy} onClick={() => setOnboardingStage('imagery')}>Back</button></div>
       </>;
       case 'domains': return <>
         <p className="eyebrow">Best possible self · review</p>
@@ -567,7 +793,6 @@ export default function App() {
       <p className="eyebrow">{calendarDay === yesterdayDateKey() ? 'Yesterday’s calendar' : `Calendar for ${dayLabel(calendarDay)}`}</p>
       <h2>What filled your day?</h2>
       <p className="lead">Add the events you remember from {dayLabel(calendarDay)}. You’ll use this same list for both reflection activities.</p>
-      <p className="privacy-note">Use general event titles. Please leave out names, addresses, and contact details.</p>
       <EudiaMessage><p>A meal, a conversation, work, a quiet moment—anything that felt part of your day can go here.</p></EudiaMessage>
       {calendarDraft.length > 0 && <div className="event-list" style={{ marginBottom: 25 }}>{calendarDraft.map((event) => <div className="event-card" key={event.id}><span className="event-icon" aria-hidden="true">▦</span><span className="event-info"><strong>{event.title}</strong><span>{clockTime(event.start)}–{clockTime(event.end)}</span></span><button className="btn ghost small" aria-label={`Edit ${event.title}`} onClick={() => editEvent(event)}>Edit</button><button className="event-remove" aria-label={`Remove ${event.title}`} onClick={() => setCalendarDraft((previous) => previous.filter((item) => item.id !== event.id))}>×</button></div>)}</div>}
       <div className="panel"><h3>{editingEventId ? 'Edit event' : 'Add an event'}</h3><p className="body-copy" style={{ marginTop: 0 }}>Only a title and time needed. Add as many as you want.</p>
@@ -668,13 +893,13 @@ function PhilosophyBaseline({ draft, update, busy, onComplete }: {
   </>;
 }
 
-function PhilosophyActive({ profile, draft, update, busy, onComplete }: {
+function PhilosophyActive({ profile, draft, update, busy, skipMode, onComplete }: {
   profile: ParticipantProfile; draft: Record<string, unknown>; update: (patch: Record<string, unknown>) => void;
-  busy: boolean; onComplete: (data: unknown) => void;
+  busy: boolean; skipMode: boolean; onComplete: (data: unknown) => void;
 }) {
   const savedRecommendation = draft.recommendation && typeof draft.recommendation === 'object' ? draft.recommendation as PhilosopherRecommendation : null;
   const [recommendation, setRecommendation] = useState<PhilosopherRecommendation | null>(savedRecommendation);
-  const [recommending, setRecommending] = useState(!savedRecommendation && !draft.philosopherId && (!draft.phase || draft.phase === 'choose'));
+  const [recommending, setRecommending] = useState(!skipMode && !savedRecommendation && !draft.philosopherId && (!draft.phase || draft.phase === 'choose'));
   const [sending, setSending] = useState(false);
   const [localError, setLocalError] = useState('');
   const chatEnd = useRef<HTMLDivElement>(null);
@@ -687,7 +912,7 @@ function PhilosophyActive({ profile, draft, update, busy, onComplete }: {
   const userTurns = messages.filter((message) => message.role === 'user').length;
 
   useEffect(() => {
-    if (savedRecommendation || selectedId || phase !== 'choose') return;
+    if (skipMode || savedRecommendation || selectedId || phase !== 'choose') return;
     let cancelled = false;
     const startedAt = performance.now();
     void recommendPhilosopher(profile).then((result) => {
@@ -702,7 +927,7 @@ function PhilosophyActive({ profile, draft, update, busy, onComplete }: {
       }
     }).finally(() => { if (!cancelled) setRecommending(false); });
     return () => { cancelled = true; };
-  }, [profile.essay]);
+  }, [profile.essay, skipMode]);
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }, [messages.length]);
 
   const beginChat = async () => {

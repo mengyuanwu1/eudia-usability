@@ -24,6 +24,7 @@ const EVENT_NAMES = [
   'challenge_started', 'challenge_returned',
   'onboarding_saved', 'completion_redirect',
   'study_resumed', 'visibility_changed',
+  'admin_skip',
 ] as const;
 type StudyEventName = (typeof EVENT_NAMES)[number];
 const SCREEN_NAMES = [
@@ -33,7 +34,7 @@ const SCREEN_NAMES = [
 ] as const;
 const AI_OPERATIONS = [
   'categorize_bps', 'recommend_philosopher', 'philosophy_turn',
-  'generate_challenge',
+  'generate_challenge', 'transcribe_bps',
 ] as const;
 const OUTCOMES = ['success', 'error', 'done', 'partly', 'not_today'] as const;
 const VISIBILITY_STATES = ['visible', 'hidden'] as const;
@@ -42,6 +43,7 @@ interface Profile {
   essay: string;
   domains: Record<(typeof DOMAINS)[number], string>;
   goal?: string;
+  adminSkipped?: true;
 }
 
 interface CalendarEvent {
@@ -50,6 +52,7 @@ interface CalendarEvent {
   start: string;
   end: string;
   notes?: string;
+  adminSkipped?: true;
 }
 
 interface SurveyAnswers {
@@ -159,6 +162,10 @@ function parseEventMetadata(name: StudyEventName, value: unknown): Record<string
   if (Object.keys(raw).some((key) => !allowedKeys.has(key))) {
     throw new HttpsError('invalid-argument', 'Event metadata contains an unsupported field.');
   }
+  if (name === 'admin_skip' && Object.keys(raw).some((key) =>
+    key !== 'screen' && key !== 'sessionKey')) {
+    throw new HttpsError('invalid-argument', 'Admin skip records only screen or session key.');
+  }
   const parsed: Record<string, string | number> = {};
   const enumField = (key: string, allowed: readonly string[]) => {
     if (raw[key] === undefined) return;
@@ -198,6 +205,9 @@ function parseEventMetadata(name: StudyEventName, value: unknown): Record<string
   if (name === 'visibility_changed' && !parsed['visibility']) {
     throw new HttpsError('invalid-argument', 'Visibility state is required.');
   }
+  if (name === 'admin_skip' && !parsed['screen'] && !parsed['sessionKey']) {
+    throw new HttpsError('invalid-argument', 'Admin skip target is required.');
+  }
   return parsed;
 }
 
@@ -228,7 +238,11 @@ function parseProfile(value: unknown): Profile {
     domain, cleanText(rawDomains[domain] ?? '', 3000, domain),
   ])) as Profile['domains'];
   const goal = cleanText(raw['goal'] ?? '', 1000, 'Goal');
-  return { essay, domains, ...(goal ? { goal } : {}) };
+  if (raw['adminSkipped'] !== undefined && typeof raw['adminSkipped'] !== 'boolean') {
+    throw new HttpsError('invalid-argument', 'Invalid admin skip marker.');
+  }
+  return { essay, domains, ...(goal ? { goal } : {}),
+    ...(raw['adminSkipped'] === true ? { adminSkipped: true as const } : {}) };
 }
 
 function parseCalendarEvents(value: unknown): CalendarEvent[] {
@@ -243,6 +257,9 @@ function parseCalendarEvents(value: unknown): CalendarEvent[] {
     const start = cleanText(raw['start'], 50, `Event ${index + 1} start`);
     const end = cleanText(raw['end'], 50, `Event ${index + 1} end`);
     const notes = cleanText(raw['notes'] ?? '', 1000, `Event ${index + 1} notes`);
+    if (raw['adminSkipped'] !== undefined && typeof raw['adminSkipped'] !== 'boolean') {
+      throw new HttpsError('invalid-argument', `Event ${index + 1} has invalid admin skip marker.`);
+    }
     if (!id || !title || !start || !end || ids.has(id)) {
       throw new HttpsError('invalid-argument', `Event ${index + 1} is incomplete or repeated.`);
     }
@@ -253,7 +270,8 @@ function parseCalendarEvents(value: unknown): CalendarEvent[] {
       throw new HttpsError('invalid-argument', `Event ${index + 1} has invalid times.`);
     }
     return { id, title, start: new Date(startMs).toISOString(),
-      end: new Date(endMs).toISOString(), ...(notes ? { notes } : {}) };
+      end: new Date(endMs).toISOString(), ...(notes ? { notes } : {}),
+      ...(raw['adminSkipped'] === true ? { adminSkipped: true as const } : {}) };
   });
 }
 
@@ -342,6 +360,9 @@ export const studyLogEvent = onCall({ region: REGION }, async (request) => {
     if (!runSnap.exists) {
       throw new HttpsError('failed-precondition', 'Open the study before logging events.');
     }
+    if (name === 'admin_skip' && stateFrom(runSnap.data()).launchContext) {
+      throw new HttpsError('permission-denied', 'Admin skip is unavailable in participant studies.');
+    }
     const quota = asRecord(quotaSnap.data());
     const total = Number(quota['total'] ?? 0);
     if (!Number.isFinite(total) || total >= 500) {
@@ -376,6 +397,10 @@ export const studySaveOnboarding = onCall({ region: REGION }, async (request) =>
   return admin.firestore().runTransaction(async (tx) => {
     const snap = await tx.get(ref);
     const state = stateFrom(snap.data());
+    if (state.launchContext && (profile.adminSkipped ||
+      profile.essay.startsWith('Preview admin skip:'))) {
+      throw new HttpsError('permission-denied', 'Admin skip is unavailable in participant studies.');
+    }
     if (Object.keys(state.sessions).length) {
       throw new HttpsError('failed-precondition', 'Onboarding is locked after the first session.');
     }
@@ -392,6 +417,10 @@ export const studySaveCalendarEvents = onCall({ region: REGION }, async (request
   return admin.firestore().runTransaction(async (tx) => {
     const snap = await tx.get(ref);
     const state = stateFrom(snap.data());
+    if (state.launchContext && events.some((event) =>
+      event.adminSkipped || event.id.startsWith('preview-admin-'))) {
+      throw new HttpsError('permission-denied', 'Admin skip is unavailable in participant studies.');
+    }
     if (!state.onboarding) {
       throw new HttpsError('failed-precondition', 'Finish onboarding first.');
     }
@@ -413,6 +442,11 @@ export const studySaveSession = onCall({ region: REGION }, async (request) => {
   return admin.firestore().runTransaction(async (tx) => {
     const snap = await tx.get(ref);
     const state = stateFrom(snap.data());
+    const sessionData = asRecord(data);
+    if (state.launchContext &&
+      (sessionData['adminSkipped'] === true || sessionData['preview'] === true)) {
+      throw new HttpsError('permission-denied', 'Admin skip is unavailable in participant studies.');
+    }
     if (!state.onboarding) {
       throw new HttpsError('failed-precondition', 'Finish onboarding first.');
     }

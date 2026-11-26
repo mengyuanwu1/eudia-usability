@@ -50,6 +50,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .progress-track { flex: 1; height: 8px; border-radius: 99px; background: #d7ebed; overflow: hidden; }
 .progress-fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg,#69cbc5,#2aa6a1); transition: width .35s ease; }
 .progress-count { font-size: 13px; color: #5d777b; font-weight: 700; white-space: nowrap; }
+.admin-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: -8px 0 18px; padding: 11px 14px; border: 1px solid #c5c8ee; border-radius: 11px; background: #f2f3fd; color: #4e5388; font-size: 13px; }
+.admin-toolbar strong { font-weight: 800; }
+.admin-skip-button { flex: none; border: 1px solid #a8aee5; border-radius: 8px; background: #fff; color: #454d93; padding: 7px 12px; font-size: 13px; font-weight: 800; }
+.admin-skip-button:hover:not(:disabled) { background: #e8eafe; }
+.admin-skip-button:disabled { opacity: .55; }
 
 .content-layout { display: grid; grid-template-columns: minmax(0, 1fr) 270px; gap: 24px; align-items: start; }
 .content-main { min-width: 0; }
@@ -78,7 +83,6 @@ h3 { font: 800 18px/1.25 Manrope,sans-serif; letter-spacing: -.025em; color: #23
 .body-copy { color: #557176; font-size: 15px; line-height: 1.6; }
 .muted { color: #6b8588; }
 .small { font-size: 13px; }
-.privacy-note { color: #52767a; background: #eef8f9; border-left: 3px solid #83c9c5; border-radius: 0 7px 7px 0; padding: 10px 13px; margin: -10px 0 23px; font-size: 13px; line-height: 1.5; }
 .section-spacer { height: 24px; }
 
 .hero-illustration { display: flex; justify-content: center; align-items: center; min-height: 190px; border-radius: 16px; margin: 2px 0 28px; background: radial-gradient(circle at 50% 40%, #d3f3f1 0 20%, #e9f8f7 65%, #f4fbfa 100%); }
@@ -107,6 +111,16 @@ h3 { font: 800 18px/1.25 Manrope,sans-serif; letter-spacing: -.025em; color: #23
 .textarea.lined { min-height: 220px; line-height: 30px; background-image: linear-gradient(transparent 29px,#e5eff0 30px); background-size: 100% 30px; padding-top: 2px; }
 .two-cols { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; }
 .field-error { color: #9b4141; font-size: 13px; margin: 7px 0 0; }
+.audio-recorder { margin: -6px 0 24px; padding: 17px 19px; border: 1px dashed #a9d6d4; border-radius: 12px; background: #f5fbfa; }
+.audio-recorder-copy { display: grid; gap: 4px; margin-bottom: 13px; }
+.audio-recorder-copy strong { color: #24585a; font-size: 15px; }
+.audio-recorder-copy span { color: #607d80; font-size: 13px; line-height: 1.5; }
+.audio-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; min-height: 42px; }
+.audio-status { margin: 0; color: #56777a; font-size: 13px; line-height: 1.45; }
+.recording-indicator { display: inline-flex; align-items: center; gap: 8px; margin-right: 4px; color: #92504b; font-size: 14px; font-weight: 800; white-space: nowrap; }
+.recording-dot { width: 9px; height: 9px; flex: none; border-radius: 50%; background: #d65e55; box-shadow: 0 0 0 4px #f9e2df; }
+.audio-success { margin: 12px 0 0; color: #24716c; font-size: 13px; font-weight: 700; }
+.audio-spinner { width: 20px; height: 20px; border-width: 2px; }
 
 .actions { display: flex; flex-wrap: wrap; gap: 11px; margin-top: 30px; align-items: center; }
 .btn { min-height: 48px; padding: 11px 23px; border: 1px solid transparent; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; color: #073b3d; background: #69cbc5; font-weight: 800; font-size: 15px; transition: transform .13s, background .13s, box-shadow .13s; }
@@ -233,6 +247,7 @@ h3 { font: 800 18px/1.25 Manrope,sans-serif; letter-spacing: -.025em; color: #23
   .progress-copy { min-width: 105px; }
   .progress-copy strong { font-size: 12px; }
   .progress-count { font-size: 11px; }
+  .admin-toolbar { align-items: stretch; flex-direction: column; }
   .main-card { padding: 25px 20px 28px; border-radius: 15px; }
   h1 { font-size: 30px; }
   h2 { font-size: 25px; }
